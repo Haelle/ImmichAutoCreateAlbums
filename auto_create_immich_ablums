@@ -273,13 +273,18 @@ search_assets_for_month() {
      (.originalPath | sub("^" + $pre + "/?"; "")) as $norm |
      "\(.id)|\($norm)"' >> "$out_file"
 
-
     local has_next
-    has_next=$(echo "$resp" | jq -r '.hasNextPage // "false"')
+    next_page=$(echo "$resp" | jq -r '.assets.nextPage')
+    if [[ "$next_page" == "null" || -z "$next_page" ]]; then
+      has_next="false"
+    else
+      has_next="true"
+      page="$next_page"
+    fi
+
     if [[ "$has_next" != "true" ]]; then
       break
     fi
-    page=$((page+1))
   done
 
   local count
