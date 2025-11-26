@@ -12,10 +12,19 @@ IMMICH_ALBUM_TAG="${IMMICH_ALBUM_TAG:-XMP:Album}"
 IMMICH_CACHE_DIR="${IMMICH_CACHE_DIR:-./immich-albums}"
 IMMICH_PREFIX="${IMMICH_PREFIX:-/usr/src/app/upload}"
 
+# Pour le mode "5 étoiles"
+IMMICH_RATING_TAG="${IMMICH_RATING_TAG:-XMP:Rating}"
+FIVE_STAR_RATING="${FIVE_STAR_RATING:-5}"
+FIVE_STAR_ALBUM_NAME="${FIVE_STAR_ALBUM_NAME:-5 Stars}"
+
 # taille de page pour /search/metadata
 IMMICH_SEARCH_PAGE_SIZE=1000
 
-mkdir -p "$IMMICH_CACHE_DIR"
+# Sous-dossiers pour les timestamps
+IMMICH_TS_ALBUMS_DIR="${IMMICH_TS_ALBUMS_DIR:-$IMMICH_CACHE_DIR/albums}"
+IMMICH_TS_STARS_DIR="${IMMICH_TS_STARS_DIR:-$IMMICH_CACHE_DIR/five-stars}"
+
+mkdir -p "$IMMICH_CACHE_DIR" "$IMMICH_TS_ALBUMS_DIR" "$IMMICH_TS_STARS_DIR"
 
 ########################################
 # Logs & compteurs
@@ -34,6 +43,7 @@ ERROR_API=0
 DRY_RUN=0
 FORCE=0
 MODE_ALL=0
+FIVE_STARS_MODE=0   # 0 = mode album par tag, 1 = mode "5 étoiles"
 
 log() {
   local level="$1"; shift
@@ -47,18 +57,33 @@ Usage:
   $(basename "$0") [--dry-run] [--force] <dossier_annee-mois-nom>
   $(basename "$0") [--dry-run] [--force] --all
 
+Modes :
+  (par défaut)  : albums basés sur le tag EXIF IMMICH_ALBUM_TAG
+  --five-stars  : ajoute toutes les photos avec rating=FIVE_STAR_RATING
+                  dans l'album FIVE_STAR_ALBUM_NAME
+
 Le dossier attendu ressemble à : 2007-11-november
 
 Arguments:
-  --dry-run   : ne rien envoyer à Immich, juste simuler
-  --force     : ignorer le fichier LASTRUN pour les dossiers traités
-  --all       : traiter tous les sous-dossiers de PHOTOS_ROOT (niveau 1)
+  --dry-run           : ne rien envoyer à Immich, juste simuler
+  --force             : ignorer le fichier LASTRUN pour les dossiers traités
+  --all               : traiter tous les sous-dossiers de PHOTOS_ROOT (niveau 1)
+  --five-stars        : activer le mode "5 étoiles"
+  --five-stars-album  : nom de l'album cible pour les 5 étoiles
+
+Variables d'env utiles:
+  IMMICH_URL, IMMICH_API_KEY, PHOTOS_ROOT, IMMICH_ALBUM_TAG
+  IMMICH_PREFIX, IMMICH_RATING_TAG, FIVE_STAR_RATING, FIVE_STAR_ALBUM_NAME
 
 Exemples:
   PHOTOS_ROOT=/srv/photos/Photos \\
   IMMICH_URL=https://immich.example.com/api \\
   IMMICH_API_KEY=XXX \\
   $(basename "$0") /srv/photos/Photos/2007-11-november
+
+  # Mode 5 étoiles pour tous les mois
+  FIVE_STAR_ALBUM_NAME="⭐ 5 étoiles" \\
+  $(basename "$0") --five-stars --all
 
 EOF
 }
@@ -81,6 +106,15 @@ while [[ $# -gt 0 ]]; do
     --all)
       MODE_ALL=1
       shift
+      ;;
+    --five-stars)
+      FIVE_STARS_MODE=1
+      shift
+      ;;
+    --five-stars-album)
+      FIVE_STARS_MODE=1
+      FIVE_STAR_ALBUM_NAME="$2"
+      shift 2
       ;;
     -h|--help)
       usage
@@ -252,8 +286,6 @@ search_assets_for_month() {
       --argjson page "$page" \
       '{size: $size, page: $page, takenAfter: $ta, takenBefore: $tb}')
 
-    #echo $body
-
     local resp
     if ! resp=$(curl -sS -f -X POST \
       -H "Content-Type: application/json" \
@@ -266,9 +298,6 @@ search_assets_for_month() {
         break
     fi
 
-    #echo $resp
-
-    #echo "$resp" | jq -r '.assets.items[] | "\(.id)|\(.originalPath)"' >> "$out_file"
     echo "$resp" | jq -r --arg pre "$IMMICH_PREFIX" \
   '.assets.items[] |
      (.originalPath | sub("^" + $pre + "/?"; "")) as $norm |
@@ -320,13 +349,22 @@ process_month_dir() {
 
   local year_month="${year}-${month}"
 
-  local lastrun_file="$IMMICH_CACHE_DIR/lastrun_${year_month}.stamp"
+  # Dossier de timestamps selon le mode
+  local ts_dir
+  if [[ "$FIVE_STARS_MODE" -eq 1 ]]; then
+    ts_dir="$IMMICH_TS_STARS_DIR"
+  else
+    ts_dir="$IMMICH_TS_ALBUMS_DIR"
+  fi
+
+  local lastrun_file="$ts_dir/lastrun_${year_month}.stamp"
 
   local tmp_changed tmp_exif tmp_assets tmp_album_assets
   tmp_changed="$(mktemp)"
   tmp_exif="$(mktemp)"
   tmp_assets="$(mktemp)"
   tmp_album_assets="$(mktemp)"
+  local tmp_rating=""
 
   # 1. Détection des fichiers modifiés/nouveaux
   if [[ "$FORCE" -eq 1 || ! -f "$lastrun_file" ]]; then
@@ -357,84 +395,179 @@ process_month_dir() {
     exit 1
   fi
 
-  awk '{print}' "$tmp_changed" | tr '\n' '\0' | \
-    xargs -0 exiftool -fast2 -json "-$IMMICH_ALBUM_TAG" > "$tmp_exif" || true
+  ########################################
+  # 2. Extraction EXIF selon le mode
+  ########################################
 
-  : > "$tmp_album_assets"
+  if [[ "$FIVE_STARS_MODE" -eq 0 ]]; then
+    # --- Mode original : album depuis IMMICH_ALBUM_TAG ---
+    log "INFO" "Extraction EXIF ($IMMICH_ALBUM_TAG) via exiftool..."
 
-  jq -r --arg tag "$IMMICH_ALBUM_TAG" '
-    .[] |
-    .SourceFile as $f |
-    .[$tag] as $a |
-    if $a == null then
-      empty
-    else
-      (if ($a | type) == "array" then $a[0] else $a end) as $album |
-      if $album == null or $album == "" then empty
-      else "\($f)|\($album)" end
-    end
-  ' "$tmp_exif" > "$tmp_album_assets" || true
+    awk '{print}' "$tmp_changed" | tr '\n' '\0' | \
+      xargs -0 exiftool -fast2 -json "-$IMMICH_ALBUM_TAG" > "$tmp_exif" || true
 
-  local nb_tagged
-  nb_tagged=$(wc -l < "$tmp_album_assets" || echo 0)
-  local nb_untagged=$((nb_changed - nb_tagged))
-  if [[ "$nb_untagged" -gt 0 ]]; then
-    WARN_NO_EXIF_TAG=$((WARN_NO_EXIF_TAG+nb_untagged))
-    log "INFO" "$nb_untagged fichiers sans tag $IMMICH_ALBUM_TAG (ignorés)"
+    : > "$tmp_album_assets"
+
+    jq -r --arg tag "$IMMICH_ALBUM_TAG" '
+      .[] |
+      .SourceFile as $f |
+      .[$tag] as $a |
+      if $a == null then
+        empty
+      else
+        (if ($a | type) == "array" then $a[0] else $a end) as $album |
+        if $album == null or $album == "" then empty
+        else "\($f)|\($album)" end
+      end
+    ' "$tmp_exif" > "$tmp_album_assets" || true
+
+    local nb_tagged
+    nb_tagged=$(wc -l < "$tmp_album_assets" || echo 0)
+    local nb_untagged=$((nb_changed - nb_tagged))
+    if [[ "$nb_untagged" > 0 ]]; then
+      WARN_NO_EXIF_TAG=$((WARN_NO_EXIF_TAG+nb_untagged))
+      log "INFO" "$nb_untagged fichiers sans tag $IMMICH_ALBUM_TAG (ignorés)"
+    fi
+
+    if [[ "$nb_tagged" -eq 0 ]]; then
+      log "INFO" "Aucun fichier avec tag d'album pour ce run"
+      touch "$lastrun_file"
+      rm -f "$tmp_changed" "$tmp_exif" "$tmp_assets" "$tmp_album_assets"
+      return
+    fi
+
+  else
+    # --- Mode 5 étoiles : filtrage sur IMMICH_RATING_TAG ---
+    tmp_rating="$(mktemp)"
+
+    log "INFO" "Extraction EXIF rating ($IMMICH_RATING_TAG) via exiftool..."
+
+    awk '{print}' "$tmp_changed" | tr '\n' '\0' | \
+      xargs -0 exiftool -fast2 -json "-$IMMICH_RATING_TAG" > "$tmp_exif" || true
+
+    jq -r --arg tag "$IMMICH_RATING_TAG" --argjson rating "$FIVE_STAR_RATING" '
+      .[] |
+      .SourceFile as $f |
+      .[$tag] as $r |
+      (if $r == null then null
+       elif ($r | type) == "string" then ($r | tonumber?)
+       else $r end) as $val |
+      select($val == $rating) |
+      $f
+    ' "$tmp_exif" > "$tmp_rating" || true
+
+    local nb_tagged
+    nb_tagged=$(wc -l < "$tmp_rating" || echo 0)
+    local nb_untagged=$((nb_changed - nb_tagged))
+    if [[ "$nb_untagged" -gt 0 ]]; then
+      WARN_NO_EXIF_TAG=$((WARN_NO_EXIF_TAG+nb_untagged))
+      log "INFO" "$nb_untagged fichiers sans rating=$FIVE_STAR_RATING (ignorés)"
+    fi
+
+    if [[ "$nb_tagged" -eq 0 ]]; then
+      log "INFO" "Aucun fichier avec rating=$FIVE_STAR_RATING pour ce run"
+      touch "$lastrun_file"
+      rm -f "$tmp_changed" "$tmp_exif" "$tmp_assets" "$tmp_album_assets"
+      [[ -n "$tmp_rating" ]] && rm -f "$tmp_rating"
+      return
+    fi
   fi
 
-  if [[ "$nb_tagged" -eq 0 ]]; then
-    log "INFO" "Aucun fichier avec tag d'album pour ce run"
-    touch "$lastrun_file"
-    rm -f "$tmp_changed" "$tmp_exif" "$tmp_assets" "$tmp_album_assets"
-    return
-  fi
+  ########################################
+  # 3. Récupérer les assets Immich pour ce mois
+  ########################################
 
-  # 4. Récupérer les assets Immich pour ce mois
   search_assets_for_month "$year" "$month" "$tmp_assets"
 
-  # 5. Construire mapping album -> asset_ids
-  : > "$tmp_album_assets.tmp"
-  mv "$tmp_album_assets" "$tmp_album_assets.tmp"
-  : > "$tmp_album_assets"
+  ########################################
+  # 4. Matching fichiers -> asset_id
+  ########################################
 
-  while IFS='|' read -r file_path album_name; do
-    local rel
-    rel="${file_path#$PHOTOS_ROOT/}"
-    if [[ "$rel" == "$file_path" ]]; then
-      rel="${file_path#$month_dir/}"
-    fi
+  if [[ "$FIVE_STARS_MODE" -eq 0 ]]; then
+    # Mode album par tag
+    : > "$tmp_album_assets.tmp"
+    mv "$tmp_album_assets" "$tmp_album_assets.tmp"
+    : > "$tmp_album_assets"
 
-    #echo $rel
-    #echo $(cat $tmp_assets)
+    while IFS='|' read -r file_path album_name; do
+      local rel
+      rel="${file_path#$PHOTOS_ROOT/}"
+      if [[ "$rel" == "$file_path" ]]; then
+        rel="${file_path#$month_dir/}"
+      fi
 
-    local matches
-    matches="$(grep -F "|$rel" "$tmp_assets" || true)"
+      local matches
+      matches="$(grep -F "|$rel" "$tmp_assets" || true)"
 
-    if [[ -z "$matches" ]]; then
-      WARN_NO_ASSET_MATCH=$((WARN_NO_ASSET_MATCH+1))
-      log "WARN" "Pas d'asset Immich pour '$file_path'"
-      continue
-    fi
+      if [[ -z "$matches" ]]; then
+        WARN_NO_ASSET_MATCH=$((WARN_NO_ASSET_MATCH+1))
+        log "WARN" "Pas d'asset Immich pour '$file_path'"
+        continue
+      fi
 
-    local nb_matches
-    nb_matches=$(printf '%s\n' "$matches" | sed '/^$/d' | wc -l || echo 0)
+      local nb_matches
+      nb_matches=$(printf '%s\n' "$matches" | sed '/^$/d' | wc -l || echo 0)
 
-    if [[ "$nb_matches" -gt 1 ]]; then
-      WARN_MULTIPLE_ASSET_MATCH=$((WARN_MULTIPLE_ASSET_MATCH+1))
-      log "WARN" "Plusieurs assets possibles pour '$file_path' (rel='$rel'), aucun ajouté"
-      continue
-    fi
+      if [[ "$nb_matches" -gt 1 ]]; then
+        WARN_MULTIPLE_ASSET_MATCH=$((WARN_MULTIPLE_ASSET_MATCH+1))
+        log "WARN" "Plusieurs assets possibles pour '$file_path' (rel='$rel'), aucun ajouté"
+        continue
+      fi
 
-    local line asset_id
-    line="$(printf '%s\n' "$matches" | sed -n '1p')"
-    asset_id="${line%%|*}"
+      local line asset_id
+      line="$(printf '%s\n' "$matches" | sed -n '1p')"
+      asset_id="${line%%|*}"
 
-    echo "$album_name|$asset_id" >> "$tmp_album_assets"
-  done < "$tmp_album_assets.tmp"
+      echo "$album_name|$asset_id" >> "$tmp_album_assets"
+    done < "$tmp_album_assets.tmp"
 
+    rm -f "$tmp_album_assets.tmp"
 
-  rm -f "$tmp_album_assets.tmp"
+  else
+    # Mode 5 étoiles : tous les fichiers concernés vont dans un album unique
+    : > "$tmp_album_assets"
+
+    while IFS= read -r file_path; do
+      [[ -z "$file_path" ]] && continue
+
+      local rel
+      rel="${file_path#$PHOTOS_ROOT/}"
+      if [[ "$rel" == "$file_path" ]]; then
+        rel="${file_path#$month_dir/}"
+      fi
+
+      local matches
+      matches="$(grep -F "|$rel" "$tmp_assets" || true)"
+
+      if [[ -z "$matches" ]]; then
+        WARN_NO_ASSET_MATCH=$((WARN_NO_ASSET_MATCH+1))
+        log "WARN" "Pas d'asset Immich pour '$file_path'"
+        continue
+      fi
+
+      local nb_matches
+      nb_matches=$(printf '%s\n' "$matches" | sed '/^$/d' | wc -l || echo 0)
+
+      if [[ "$nb_matches" -gt 1 ]]; then
+        WARN_MULTIPLE_ASSET_MATCH=$((WARN_MULTIPLE_ASSET_MATCH+1))
+        log "WARN" "Plusieurs assets possibles pour '$file_path' (rel='$rel'), aucun ajouté"
+        continue
+      fi
+
+      local line asset_id
+      line="$(printf '%s\n' "$matches" | sed -n '1p')"
+      asset_id="${line%%|*}"
+
+      # on stocke comme si c'était un album normal
+      echo "$FIVE_STAR_ALBUM_NAME|$asset_id" >> "$tmp_album_assets"
+    done < "$tmp_rating"
+
+    [[ -n "$tmp_rating" ]] && rm -f "$tmp_rating"
+  fi
+
+  ########################################
+  # 5. Envoi dans les albums
+  ########################################
 
   local nb_pairs
   nb_pairs=$(wc -l < "$tmp_album_assets" || echo 0)
@@ -481,13 +614,13 @@ fi
 
 echo
 log "INFO" "===== Synthèse ====="
-log "INFO" "Albums créés          : $SUCCESS_CREATED_ALBUMS"
-log "INFO" "Albums réutilisés     : $SUCCESS_REUSED_ALBUMS"
-log "INFO" "Assets ajoutés        : $SUCCESS_ASSETS_ADDED"
-log "INFO" "Fichiers sans tag EXIF: $WARN_NO_EXIF_TAG"
-log "INFO" "Fichiers sans asset   : $WARN_NO_ASSET_MATCH"
-log "INFO" "Conflits multi-asset  : $WARN_MULTIPLE_ASSET_MATCH"
-log "INFO" "Erreurs API           : $ERROR_API"
+log "INFO" "Albums créés            : $SUCCESS_CREATED_ALBUMS"
+log "INFO" "Albums réutilisés       : $SUCCESS_REUSED_ALBUMS"
+log "INFO" "Assets ajoutés          : $SUCCESS_ASSETS_ADDED"
+log "INFO" "Fichiers sans tag/rating: $WARN_NO_EXIF_TAG"
+log "INFO" "Fichiers sans asset     : $WARN_NO_ASSET_MATCH"
+log "INFO" "Conflits multi-asset    : $WARN_MULTIPLE_ASSET_MATCH"
+log "INFO" "Erreurs API             : $ERROR_API"
 echo
 
 exit 0
