@@ -230,12 +230,13 @@ search_assets_for_month() {
 
   local year_month="${year}-${month}"
 
-  # début du mois UTC
+  # ajout d'une marge d'erreur pour les photos prises tard et différence entre rangement et EXIF
+  # dernier jour du mois précédent UTC
   local start_iso
-  start_iso=$(date -u -d "${year}-${month}-01T00:00:00" +"%Y-%m-%dT%H:%M:%SZ")
-  # début du mois suivant
+  start_iso=$(date -u -d "${year}-${month}-01T00:00:00 UTC -1 day" +"%Y-%m-%dT%H:%M:%SZ")
+  # second jour du mois suivant
   local end_iso
-  end_iso=$(date -u -d "${year}-${month}-01T00:59:00 +1 month" +"%Y-%m-%dT%H:%M:%SZ")
+  end_iso=$(date -u -d "${year}-${month}-01T00:00:00 UTC +1 month +1 day" +"%Y-%m-%dT%H:%M:%SZ")
 
   log "INFO" "Récupération des assets Immich pour la période [$start_iso ; $end_iso)"
 
