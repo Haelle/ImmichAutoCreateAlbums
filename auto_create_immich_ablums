@@ -1,0 +1,488 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+########################################
+# Configuration
+########################################
+
+IMMICH_URL="${IMMICH_URL:-https://immich.example.com/api}"
+IMMICH_API_KEY="${IMMICH_API_KEY:-}"
+PHOTOS_ROOT="${PHOTOS_ROOT:-/path/to/Photos}"
+IMMICH_ALBUM_TAG="${IMMICH_ALBUM_TAG:-XMP:Album}"
+IMMICH_CACHE_DIR="${IMMICH_CACHE_DIR:-./immich-albums}"
+IMMICH_PREFIX="${IMMICH_PREFIX:-/usr/src/app/upload}"
+
+# taille de page pour /search/metadata
+IMMICH_SEARCH_PAGE_SIZE=1000
+
+mkdir -p "$IMMICH_CACHE_DIR"
+
+########################################
+# Logs & compteurs
+########################################
+
+SUCCESS_CREATED_ALBUMS=0
+SUCCESS_REUSED_ALBUMS=0
+SUCCESS_ASSETS_ADDED=0
+
+WARN_NO_EXIF_TAG=0
+WARN_NO_ASSET_MATCH=0
+WARN_MULTIPLE_ASSET_MATCH=0
+
+ERROR_API=0
+
+DRY_RUN=0
+FORCE=0
+MODE_ALL=0
+
+log() {
+  local level="$1"; shift
+  local msg="$*"
+  printf '%s [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$msg" >&2
+}
+
+usage() {
+  cat <<EOF
+Usage:
+  $(basename "$0") [--dry-run] [--force] <dossier_annee-mois-nom>
+  $(basename "$0") [--dry-run] [--force] --all
+
+Le dossier attendu ressemble à : 2007-11-november
+
+Arguments:
+  --dry-run   : ne rien envoyer à Immich, juste simuler
+  --force     : ignorer le fichier LASTRUN pour les dossiers traités
+  --all       : traiter tous les sous-dossiers de PHOTOS_ROOT (niveau 1)
+
+Exemples:
+  PHOTOS_ROOT=/srv/photos/Photos \\
+  IMMICH_URL=https://immich.example.com/api \\
+  IMMICH_API_KEY=XXX \\
+  $(basename "$0") /srv/photos/Photos/2007-11-november
+
+EOF
+}
+
+########################################
+# Parsing des arguments
+########################################
+
+MONTH_DIR=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run|-n)
+      DRY_RUN=1
+      shift
+      ;;
+    --force)
+      FORCE=1
+      shift
+      ;;
+    --all)
+      MODE_ALL=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      if [[ -z "$MONTH_DIR" ]]; then
+        MONTH_DIR="$1"
+      else
+        log "ERROR" "Argument inattendu: $1"
+        usage
+        exit 1
+      fi
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "$IMMICH_API_KEY" ]]; then
+  log "ERROR" "IMMICH_API_KEY n'est pas défini"
+  exit 1
+fi
+
+if [[ "$MODE_ALL" -eq 0 && -z "$MONTH_DIR" ]]; then
+  log "ERROR" "Il faut soit un dossier année-mois-nom, soit --all"
+  usage
+  exit 1
+fi
+
+########################################
+# Fonctions Immich
+########################################
+
+# Cache en mémoire des albums: nom -> id
+declare -A ALBUM_IDS
+ALBUMS_LOADED=0
+
+load_albums() {
+  if [[ "$ALBUMS_LOADED" -eq 1 ]]; then
+    return
+  fi
+
+  log "INFO" "Chargement de la liste des albums Immich..."
+  local resp
+  if ! resp=$(curl -sS -f \
+    -H "Accept: application/json" \
+    -H "x-api-key: $IMMICH_API_KEY" \
+    "$IMMICH_URL/albums"); then
+    log "ERROR" "Impossible de récupérer la liste des albums"
+    ERROR_API=$((ERROR_API+1))
+    return
+  fi
+
+  while IFS='|' read -r id name; do
+    [[ -z "$id" || -z "$name" ]] && continue
+    ALBUM_IDS["$name"]="$id"
+  done < <(echo "$resp" | jq -r '.[] | "\(.id)|\(.albumName)"')
+
+  ALBUMS_LOADED=1
+  log "INFO" "Albums chargés: ${#ALBUM_IDS[@]}"
+}
+
+get_or_create_album_id() {
+  local album_name="$1"
+  local __resultvar="$2"
+
+  load_albums
+
+  if [[ -n "${ALBUM_IDS[$album_name]:-}" ]]; then
+    SUCCESS_REUSED_ALBUMS=$((SUCCESS_REUSED_ALBUMS+1))
+    printf -v "$__resultvar" '%s' "${ALBUM_IDS[$album_name]}"
+    return 0
+  fi
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "INFO" "[DRY-RUN] Créerait l'album: $album_name"
+    local fake_id="dryrun-$(echo -n "$album_name" | md5sum | cut -c1-8)"
+    ALBUM_IDS["$album_name"]="$fake_id"
+    return 0
+  fi
+
+  log "INFO" "Création de l'album: $album_name"
+  local resp
+  resp=$(curl -sS -f -X POST \
+    -H "Content-Type: application/json" \
+    -H "Accept: application/json" \
+    -H "x-api-key: $IMMICH_API_KEY" \
+    -d "$(jq -n --arg name "$album_name" '{albumName: $name}')" \
+    "$IMMICH_URL/albums") || {
+      log "ERROR" "Erreur lors de la création de l'album '$album_name'"
+      ERROR_API=$((ERROR_API+1))
+      return 1
+    }
+
+  local id
+  id=$(echo "$resp" | jq -r '.id')
+  if [[ -z "$id" || "$id" == "null" ]]; then
+    log "ERROR" "Réponse sans id pour la création de l'album '$album_name'"
+    ERROR_API=$((ERROR_API+1))
+    return 1
+  fi
+
+  ALBUM_IDS["$album_name"]="$id"
+  SUCCESS_CREATED_ALBUMS=$((SUCCESS_CREATED_ALBUMS+1))
+  printf -v "$__resultvar" '%s' "$id"
+}
+
+add_assets_to_album() {
+  local album_id="$1"; shift
+  local album_name="$1"; shift
+  local ids=("$@")
+
+  if [[ ${#ids[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  log "INFO" "Ajout de ${#ids[@]} assets dans l'album '$album_name' ($album_id)"
+
+  local body
+  body=$(printf '%s\n' "${ids[@]}" | jq -R . | jq -s '{ids: .}')
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "INFO" "[DRY-RUN] PUT /albums/$album_id/assets avec $((${#ids[@]})) assets"
+    SUCCESS_ASSETS_ADDED=$((SUCCESS_ASSETS_ADDED+${#ids[@]}))
+    return 0
+  fi
+
+  if ! curl -sS -f -X PUT \
+    -H "Content-Type: application/json" \
+    -H "Accept: application/json" \
+    -H "x-api-key: $IMMICH_API_KEY" \
+    -d "$body" \
+    "$IMMICH_URL/albums/$album_id/assets" >/dev/null; then
+      log "ERROR" "Erreur lors de l'ajout d'assets à l'album '$album_name'"
+      ERROR_API=$((ERROR_API+1))
+      return 1
+  fi
+
+  SUCCESS_ASSETS_ADDED=$((SUCCESS_ASSETS_ADDED+${#ids[@]}))
+  return 0
+}
+
+search_assets_for_month() {
+  local year="$1"
+  local month="$2"
+  local out_file="$3"
+
+  local year_month="${year}-${month}"
+
+  # début du mois UTC
+  local start_iso
+  start_iso=$(date -u -d "${year}-${month}-01T00:00:00" +"%Y-%m-%dT%H:%M:%SZ")
+  # début du mois suivant
+  local end_iso
+  end_iso=$(date -u -d "${year}-${month}-01T00:59:00 +1 month" +"%Y-%m-%dT%H:%M:%SZ")
+
+  log "INFO" "Récupération des assets Immich pour la période [$start_iso ; $end_iso)"
+
+  : > "$out_file"
+  local page=1
+
+  while :; do
+    local body
+    body=$(jq -n \
+      --arg ta "$start_iso" \
+      --arg tb "$end_iso" \
+      --argjson size "$IMMICH_SEARCH_PAGE_SIZE" \
+      --argjson page "$page" \
+      '{size: $size, page: $page, takenAfter: $ta, takenBefore: $tb}')
+
+    #echo $body
+
+    local resp
+    if ! resp=$(curl -sS -f -X POST \
+      -H "Content-Type: application/json" \
+      -H "Accept: application/json" \
+      -H "x-api-key: $IMMICH_API_KEY" \
+      -d "$body" \
+      "$IMMICH_URL/search/metadata"); then
+        log "ERROR" "Erreur lors de l'appel à /search/metadata (page $page)"
+        ERROR_API=$((ERROR_API+1))
+        break
+    fi
+
+    #echo $resp
+
+    #echo "$resp" | jq -r '.assets.items[] | "\(.id)|\(.originalPath)"' >> "$out_file"
+    echo "$resp" | jq -r --arg pre "$IMMICH_PREFIX" \
+  '.assets.items[] |
+     (.originalPath | sub("^" + $pre + "/?"; "")) as $norm |
+     "\(.id)|\($norm)"' >> "$out_file"
+
+
+    local has_next
+    has_next=$(echo "$resp" | jq -r '.hasNextPage // "false"')
+    if [[ "$has_next" != "true" ]]; then
+      break
+    fi
+    page=$((page+1))
+  done
+
+  local count
+  count=$(wc -l < "$out_file" || echo 0)
+  log "INFO" "Assets Immich pour $year_month : $count"
+}
+
+########################################
+# Traitement d'un dossier AAAA-MM-nom
+########################################
+
+process_month_dir() {
+  local month_dir="$1"
+  log "INFO" "=== Traitement du dossier: $month_dir ==="
+
+  if [[ ! -d "$month_dir" ]]; then
+    log "WARN" "Dossier inexistant: $month_dir (ignoré)"
+    return
+  fi
+
+  local dirname
+  dirname="$(basename "$month_dir")"
+
+  # On attend quelque chose comme 2007-11-november -> year=2007, month=11
+  local year month rest
+  IFS='-' read -r year month rest <<< "$dirname"
+
+  if [[ -z "$year" || -z "$month" ]]; then
+    log "ERROR" "Nom de dossier inattendu (attendu AAAA-MM-quelquechose): $dirname"
+    return
+  fi
+
+  local year_month="${year}-${month}"
+
+  local lastrun_file="$IMMICH_CACHE_DIR/lastrun_${year_month}.stamp"
+
+  local tmp_changed tmp_exif tmp_assets tmp_album_assets
+  tmp_changed="$(mktemp)"
+  tmp_exif="$(mktemp)"
+  tmp_assets="$(mktemp)"
+  tmp_album_assets="$(mktemp)"
+
+  # 1. Détection des fichiers modifiés/nouveaux
+  if [[ "$FORCE" -eq 1 || ! -f "$lastrun_file" ]]; then
+    log "INFO" "Scan complet du dossier (pas de LASTRUN ou --force) pour $dirname"
+    find "$month_dir" -type f > "$tmp_changed"
+  else
+    log "INFO" "Scan incrémental (fichiers plus récents que $lastrun_file) pour $dirname"
+    find "$month_dir" -type f -newer "$lastrun_file" > "$tmp_changed"
+  fi
+
+  local nb_changed
+  nb_changed=$(wc -l < "$tmp_changed" || echo 0)
+
+  if [[ "$nb_changed" -eq 0 ]]; then
+    log "INFO" "Aucun fichier nouveau/modifié pour $month_dir"
+    touch "$lastrun_file"
+    rm -f "$tmp_changed" "$tmp_exif" "$tmp_assets" "$tmp_album_assets"
+    return
+  fi
+
+  log "INFO" "Fichiers nouveaux/modifiés: $nb_changed"
+
+  # 2. Extraction EXIF (album)
+  log "INFO" "Extraction EXIF ($IMMICH_ALBUM_TAG) via exiftool..."
+
+  if ! xargs -0 true < /dev/null 2>/dev/null; then
+    log "ERROR" "xargs ne supporte pas -0, environnement trop exotique"
+    exit 1
+  fi
+
+  awk '{print}' "$tmp_changed" | tr '\n' '\0' | \
+    xargs -0 exiftool -fast2 -json "-$IMMICH_ALBUM_TAG" > "$tmp_exif" || true
+
+  : > "$tmp_album_assets"
+
+  jq -r --arg tag "$IMMICH_ALBUM_TAG" '
+    .[] |
+    .SourceFile as $f |
+    .[$tag] as $a |
+    if $a == null then
+      empty
+    else
+      (if ($a | type) == "array" then $a[0] else $a end) as $album |
+      if $album == null or $album == "" then empty
+      else "\($f)|\($album)" end
+    end
+  ' "$tmp_exif" > "$tmp_album_assets" || true
+
+  local nb_tagged
+  nb_tagged=$(wc -l < "$tmp_album_assets" || echo 0)
+  local nb_untagged=$((nb_changed - nb_tagged))
+  if [[ "$nb_untagged" -gt 0 ]]; then
+    WARN_NO_EXIF_TAG=$((WARN_NO_EXIF_TAG+nb_untagged))
+    log "INFO" "$nb_untagged fichiers sans tag $IMMICH_ALBUM_TAG (ignorés)"
+  fi
+
+  if [[ "$nb_tagged" -eq 0 ]]; then
+    log "INFO" "Aucun fichier avec tag d'album pour ce run"
+    touch "$lastrun_file"
+    rm -f "$tmp_changed" "$tmp_exif" "$tmp_assets" "$tmp_album_assets"
+    return
+  fi
+
+  # 4. Récupérer les assets Immich pour ce mois
+  search_assets_for_month "$year" "$month" "$tmp_assets"
+
+  # 5. Construire mapping album -> asset_ids
+  : > "$tmp_album_assets.tmp"
+  mv "$tmp_album_assets" "$tmp_album_assets.tmp"
+  : > "$tmp_album_assets"
+
+  while IFS='|' read -r file_path album_name; do
+    local rel
+    rel="${file_path#$PHOTOS_ROOT/}"
+    if [[ "$rel" == "$file_path" ]]; then
+      rel="${file_path#$month_dir/}"
+    fi
+
+    #echo $rel
+    #echo $(cat $tmp_assets)
+
+    local matches
+    matches="$(grep -F "|$rel" "$tmp_assets" || true)"
+
+    if [[ -z "$matches" ]]; then
+      WARN_NO_ASSET_MATCH=$((WARN_NO_ASSET_MATCH+1))
+      log "WARN" "Pas d'asset Immich pour '$file_path'"
+      continue
+    fi
+
+    local nb_matches
+    nb_matches=$(printf '%s\n' "$matches" | sed '/^$/d' | wc -l || echo 0)
+
+    if [[ "$nb_matches" -gt 1 ]]; then
+      WARN_MULTIPLE_ASSET_MATCH=$((WARN_MULTIPLE_ASSET_MATCH+1))
+      log "WARN" "Plusieurs assets possibles pour '$file_path' (rel='$rel'), aucun ajouté"
+      continue
+    fi
+
+    local line asset_id
+    line="$(printf '%s\n' "$matches" | sed -n '1p')"
+    asset_id="${line%%|*}"
+
+    echo "$album_name|$asset_id" >> "$tmp_album_assets"
+  done < "$tmp_album_assets.tmp"
+
+
+  rm -f "$tmp_album_assets.tmp"
+
+  local nb_pairs
+  nb_pairs=$(wc -l < "$tmp_album_assets" || echo 0)
+  if [[ "$nb_pairs" -eq 0 ]]; then
+    log "INFO" "Aucun couple album/asset à traiter pour ce run"
+    touch "$lastrun_file"
+    rm -f "$tmp_changed" "$tmp_exif" "$tmp_assets" "$tmp_album_assets"
+    return
+  fi
+
+  local album
+  while IFS= read -r album; do
+    [[ -z "$album" ]] && continue
+    mapfile -t ids < <(awk -F'|' -v a="$album" '$1==a {print $2}' "$tmp_album_assets")
+    local album_id=""
+    get_or_create_album_id "$album" album_id || continue
+    add_assets_to_album "$album_id" "$album" "${ids[@]}"
+  done < <(cut -d'|' -f1 "$tmp_album_assets" | sort -u)
+
+  touch "$lastrun_file"
+
+  rm -f "$tmp_changed" "$tmp_exif" "$tmp_assets" "$tmp_album_assets"
+
+  log "INFO" "=== Fin traitement dossier: $month_dir ==="
+}
+
+########################################
+# Exécution principale
+########################################
+
+if [[ "$MODE_ALL" -eq 1 ]]; then
+  log "INFO" "Mode --all : traitement de tous les sous-dossiers de $PHOTOS_ROOT"
+  for d in "$PHOTOS_ROOT"/*; do
+    [[ -d "$d" ]] || continue
+    process_month_dir "$d"
+  done
+else
+  process_month_dir "$MONTH_DIR"
+fi
+
+########################################
+# Synthèse finale
+########################################
+
+echo
+log "INFO" "===== Synthèse ====="
+log "INFO" "Albums créés          : $SUCCESS_CREATED_ALBUMS"
+log "INFO" "Albums réutilisés     : $SUCCESS_REUSED_ALBUMS"
+log "INFO" "Assets ajoutés        : $SUCCESS_ASSETS_ADDED"
+log "INFO" "Fichiers sans tag EXIF: $WARN_NO_EXIF_TAG"
+log "INFO" "Fichiers sans asset   : $WARN_NO_ASSET_MATCH"
+log "INFO" "Conflits multi-asset  : $WARN_MULTIPLE_ASSET_MATCH"
+log "INFO" "Erreurs API           : $ERROR_API"
+echo
+
+exit 0
+
