@@ -1,0 +1,57 @@
+#!/usr/bin/env python3
+import datetime, os, pathlib, requests
+
+URL = os.environ["IMMICH_URL"].rstrip("/")      # ex. https://photos.example.lan
+KEY = os.environ["IMMICH_API_KEY"]
+RECENT_COUNT = int(os.environ.get("RECENT_COUNT", "20"))
+DEST = pathlib.Path(os.environ.get("DEST", "~/Images/wallpapers-immich")).expanduser()
+
+RED, GREEN, YELLOW, BLUE, RESET = "\033[31m", "\033[32m", "\033[33m", "\033[34m", "\033[0m"
+
+
+def log(color, msg):
+    print(f"{color}{msg}{RESET}", flush=True)
+
+
+s = requests.Session()
+s.headers["x-api-key"] = KEY
+DEST.mkdir(parents=True, exist_ok=True)
+log(BLUE, f"Destination: {DEST}")
+
+timeline = {"visibility": "timeline", "orderBy": "createdAt", "order": "desc"}
+r = s.get(f"{URL}/timeline/buckets", params=timeline, timeout=60)
+r.raise_for_status()
+recent = set()
+for bucket in r.json():
+    r = s.get(f"{URL}/timeline/bucket", params={**timeline, "timeBucket": bucket["timeBucket"]}, timeout=60)
+    r.raise_for_status()
+    b = r.json()
+    images = sorted((c, i) for i, c, img in zip(b["id"], b["createdAt"], b["isImage"]) if img)
+    recent |= {i for _, i in images[-(RECENT_COUNT - len(recent)):]}
+    if len(recent) >= RECENT_COUNT:
+        break
+log(BLUE, f"{len(recent)} recently added images")
+
+today = datetime.date.today().isoformat()
+r = s.get(f"{URL}/memories", params={"for": today}, timeout=60)
+r.raise_for_status()
+memories = {a["id"] for m in r.json() for a in m["assets"] if a["type"] == "IMAGE"}
+log(BLUE, f"{len(memories)} memory images for {today}")
+
+wanted = recent | memories
+missing = [aid for aid in wanted if not (DEST / f"{aid}.jpg").exists()]
+log(BLUE, f"{len(missing)} to download")
+for i, aid in enumerate(missing, 1):
+    r = s.get(f"{URL}/assets/{aid}/thumbnail", params={"size": "preview"}, timeout=60)
+    if not r.ok:
+        log(RED, f"[{i}/{len(missing)}] {aid}: HTTP {r.status_code}")
+        continue
+    (DEST / f"{aid}.jpg").write_bytes(r.content)
+    log(GREEN, f"[{i}/{len(missing)}] {aid}")
+
+for f in DEST.glob("*.jpg"):
+    if f.stem not in wanted:
+        f.unlink()
+        log(YELLOW, f"Removed {f.name}")
+
+log(GREEN, "Done")
