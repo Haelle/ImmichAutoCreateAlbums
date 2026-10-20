@@ -10,7 +10,7 @@ RED, GREEN, YELLOW, BLUE, RESET = "\033[31m", "\033[32m", "\033[33m", "\033[34m"
 
 
 def log(color, msg):
-    print(f"{color}{msg}{RESET}", flush=True)
+    print(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S} {color}{msg}{RESET}", flush=True)
 
 
 s = requests.Session()
